@@ -44,10 +44,8 @@ const extractJSON = (text, type = 'object') => {
 
   try { return JSON.parse(raw); } catch (e) { /* continue */ }
 
-  // 5. Last resort: try to fix unescaped colons/quotes in values by re-extracting key-value pairs
-  //    Remove everything that's not valid JSON structure
+  // 5. Last resort: fix unescaped colons/quotes in values
   raw = raw.replace(/:\s*"([^"]*?)"\s*:/g, (match, val) => {
-    // If there's a colon inside a value followed by another colon, the value has an unescaped colon
     return `: "${val}" :`;
   });
 
@@ -57,26 +55,37 @@ const extractJSON = (text, type = 'object') => {
 };
 
 /**
- * Common completion wrapper with retry and exponential backoff
+ * Common completion wrapper with retry and exponential backoff.
+ * @param {string} systemPrompt
+ * @param {string} userPrompt
+ * @param {number} retries
+ * @param {number|null} maxTokens - cap output tokens to control cost; null = model default
+ * @param {Array}  messages       - optional full messages array (overrides system/user prompts)
  */
-const getCompletion = async (systemPrompt, userPrompt, retries = 3) => {
+const getCompletion = async (systemPrompt, userPrompt, retries = 3, maxTokens = null, messages = null) => {
   let lastError;
 
   // Validate API key is configured
   if (!process.env.AI_API_KEY || process.env.AI_API_KEY.trim() === '') {
-    throw new Error('AI_API_KEY is not set in your .env file. Please add your OpenAI API key.');
+    throw new Error('AI_API_KEY is not set in your .env file. Please add your API key.');
   }
+
+  const resolvedMessages = messages || [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userPrompt },
+  ];
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await openai.chat.completions.create({
+      const requestBody = {
         model: TEXT_MODEL,
         temperature: 0.1,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-      });
+        messages: resolvedMessages,
+      };
+      // Only set max_tokens if explicitly provided — avoids errors on models that don't support it
+      if (maxTokens) requestBody.max_tokens = maxTokens;
+
+      const response = await openai.chat.completions.create(requestBody);
       return response.choices[0].message.content;
     } catch (err) {
       lastError = err;
@@ -84,17 +93,17 @@ const getCompletion = async (systemPrompt, userPrompt, retries = 3) => {
       // Surface clear, actionable errors immediately without retry
       const status = err?.status || err?.response?.status;
       if (status === 401) {
-        throw new Error('Invalid OpenAI API key. Check AI_API_KEY in your .env file.');
+        throw new Error('Invalid API key. Check AI_API_KEY in your .env file.');
       }
       if (status === 429) {
         const isQuota = err?.message?.toLowerCase().includes('quota');
         if (isQuota) {
-          throw new Error('OpenAI quota exceeded. Check your billing at https://platform.openai.com/account/billing');
+          throw new Error('AI quota exceeded. Check your billing or switch to a free model.');
         }
         // Rate limit — retry with backoff
       }
       if (status === 503 && attempt >= retries) {
-        throw new Error('OpenAI service is temporarily unavailable. Please try again later.');
+        throw new Error('AI service is temporarily unavailable. Please try again later.');
       }
 
       console.warn(`[aiService] Attempt ${attempt}/${retries} failed (status=${status || 'N/A'}): ${err.message}`);
@@ -110,9 +119,13 @@ const getCompletion = async (systemPrompt, userPrompt, retries = 3) => {
 };
 
 /**
- * Extract topics from raw syllabus text
+ * Extract topics from raw syllabus text.
+ * Token budget: ~500 input (system) + ~8000 context + ~800 output = ~9300 tokens max
  */
 const extractTopics = async (syllabusText) => {
+  // FIX Bug 3 (partial): cap syllabus context at 8000 chars (was 12000)
+  const context = syllabusText.substring(0, 8000);
+
   const systemPrompt = `You are an expert academic syllabus analyzer.
 Your ONLY output should be a valid JSON array of objects. Do not include markdown formatting or explanations.`;
 
@@ -125,11 +138,12 @@ Return ONLY a valid JSON array of objects in this exact format:
 Extract 5-20 meaningful, distinct topics.
 
 Syllabus Text:
-${syllabusText.substring(0, 12000)}
+${context}
 
 Return ONLY the JSON array. No markdown, no explanation.`;
 
-  const text = await getCompletion(systemPrompt, userPrompt);
+  // max_tokens: 800 covers up to 20 topics comfortably
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 800);
   return extractJSON(text, 'array');
 };
 
@@ -154,18 +168,55 @@ const cleanMermaidDiagram = (raw) => {
   return diagram;
 };
 
-const generateNotes = async (topicName, syllabusContext) => {
-  const systemPrompt = `You are an expert academic tutor and notes writer.
-Your ONLY output should be a valid JSON object. Do not include markdown formatting or explanations.
+/**
+ * Generate a mermaid diagram for a topic as a SEPARATE call.
+ * FIX Bug 7: Previously embedded inside the notes JSON, causing frequent parse failures
+ * because Mermaid newlines/special chars break JSON strings. Now isolated.
+ * Token budget: ~200 input + 300 output = ~500 tokens
+ */
+const generateMermaidDiagram = async (topicName) => {
+  const systemPrompt = `You are a Mermaid.js diagram expert. Output ONLY the raw mermaid diagram text. No JSON, no markdown fences, no explanation.`;
 
-IMPORTANT for the mermaidDiagram field:
-- Use REAL newline characters inside the JSON string (the JSON will have \\\\n escape sequences naturally)
-- Do NOT wrap the mermaid code in markdown fences
-- Use simple node labels without special characters like parentheses or brackets in text
-- Keep the diagram simple with 4-8 nodes maximum`;
+  const userPrompt = `Create a simple Mermaid.js flowchart for: "${topicName}"
+Rules:
+- Start with "graph TD"
+- 4-7 nodes maximum
+- Simple labels only (no parentheses, brackets, or special chars inside node labels)
+- Use --> for connections
+
+Output ONLY the mermaid diagram. Example:
+graph TD
+  A[Main Topic] --> B[Subtopic 1]
+  A --> C[Subtopic 2]
+  B --> D[Detail 1]
+  C --> E[Detail 2]`;
+
+  try {
+    // max_tokens: 300 is plenty for a small diagram
+    const raw = await getCompletion(systemPrompt, userPrompt, 2, 300);
+    return cleanMermaidDiagram(raw);
+  } catch (err) {
+    // Non-fatal: notes are still useful without a diagram
+    console.warn(`[aiService] Mermaid generation failed for "${topicName}": ${err.message}`);
+    return '';
+  }
+};
+
+/**
+ * Generate comprehensive study notes for a topic.
+ * FIX Bug 3: Syllabus context capped at 3000 chars (was 12000) — only enough for relevant context.
+ * FIX Bug 7: mermaidDiagram generated in a separate call to avoid JSON parse failures.
+ * Token budget: ~600 input + ~3000 context + ~1800 output = ~5400 tokens
+ */
+const generateNotes = async (topicName, syllabusContext) => {
+  // FIX Bug 3: Only send a focused excerpt of the syllabus, not the whole thing
+  const contextSnippet = syllabusContext ? syllabusContext.substring(0, 3000) : '';
+
+  const systemPrompt = `You are an expert academic tutor and notes writer.
+Your ONLY output should be a valid JSON object. Do not include markdown formatting or explanations.`;
 
   const userPrompt = `Generate comprehensive study notes for: "${topicName}"
-Context: "${syllabusContext ? syllabusContext.substring(0, 12000) : ''}"
+Context: "${contextSnippet}"
 
 Return ONLY a valid JSON object:
 {
@@ -175,53 +226,54 @@ Return ONLY a valid JSON object:
   "examples": [{"title": "Title", "content": "Explanation"}],
   "importantPoints": ["Point 1", "Point 2"],
   "summary": "3-5 sentence summary for quick revision",
-  "mermaidDiagram": "graph TD\\nA[Main Topic] --> B[Subtopic 1]\\nA --> C[Subtopic 2]\\nB --> D[Detail 1]\\nC --> E[Detail 2]",
   "importantQuestions": ["Question 1?", "Question 2?"],
   "realWorldApplications": ["Application 1", "Application 2"],
   "flashcards": [{"question": "What is X?", "answer": "X is..."}]
 }
 
 Rules: keyTerms(4-6), examples(2-3), importantPoints(5-8), importantQuestions(3-5), realWorldApplications(2-3), flashcards(5-8).
-The mermaidDiagram must be valid Mermaid.js syntax starting with "graph TD" or "flowchart TD".
 Return ONLY the JSON object. No markdown, no explanation.`;
 
-  const text = await getCompletion(systemPrompt, userPrompt);
+  // max_tokens: 1800 covers all fields comfortably
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 1800);
   const result = extractJSON(text, 'object');
 
-  // Clean up the mermaid diagram
-  if (result.mermaidDiagram) {
-    result.mermaidDiagram = cleanMermaidDiagram(result.mermaidDiagram);
-  }
+  // FIX Bug 7: Generate mermaid diagram separately to avoid JSON parse failures
+  result.mermaidDiagram = await generateMermaidDiagram(topicName);
 
   return result;
 };
 
 /**
- * Chat with AI about a topic
+ * Chat with AI about a topic.
+ * FIX Bug 1: Now routes through getCompletion for retry logic and proper error handling.
+ * Token budget: ~300 system + ~400 context + history(4×~100) + ~150 question + ~400 output = ~1650 tokens
  */
 const chatWithAI = async (question, context, history = []) => {
-  const systemPrompt = `You are a helpful AI study assistant for students. Provide direct, helpful answers. You have access to the conversation history below to maintain context across questions.${context ? `\n\nStudy Context:\n${context.substring(0, 2000)}` : ''}`;
+  const systemPrompt = `You are a helpful AI study assistant for students. Provide direct, helpful answers.${
+    context ? `\n\nStudy Context:\n${context.substring(0, 1500)}` : ''
+  }`;
 
-  // Build messages array: system + history + new question
-  const historyMessages = (history || []).slice(-6).map(m => ({
+  // FIX token: trim history to last 4 messages (was 6) to reduce input tokens
+  const historyMessages = (history || []).slice(-4).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
-    content: m.content,
+    content: String(m.content).substring(0, 500), // cap each history message
   }));
 
-  const response = await openai.chat.completions.create({
-    model: TEXT_MODEL,
-    temperature: 0.7,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...historyMessages,
-      { role: 'user', content: `${question}\n\nGive a clear, student-friendly answer in 150-300 words with examples where helpful.` },
-    ],
-  });
-  return response.choices[0].message.content;
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...historyMessages,
+    { role: 'user', content: `${question}\n\nGive a clear, student-friendly answer in 100-200 words with an example where helpful.` },
+  ];
+
+  // FIX Bug 1: use getCompletion so we get retry + API key validation + error messages
+  // max_tokens: 400 keeps answers focused (was unlimited)
+  return await getCompletion(null, null, 3, 400, messages);
 };
 
 /**
- * Generate quiz questions from notes
+ * Generate quiz questions from notes content.
+ * Token budget: ~100 input + ~5000 content + ~1200 output = ~6300 tokens
  */
 const generateQuiz = async (topicsContent) => {
   const systemPrompt = `You are an expert academic quiz creator. Your ONLY output should be a valid JSON array.`;
@@ -240,18 +292,21 @@ Generate 10 multiple-choice questions based on the content. Return ONLY a JSON a
 
 Return ONLY the JSON array. No markdown.`;
 
-  const text = await getCompletion(systemPrompt, userPrompt);
+  // max_tokens: 1200 covers 10 questions with explanations
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 1200);
   return extractJSON(text, 'array');
 };
 
 /**
- * Generate flashcards for a topic
+ * Generate flashcards for a topic.
+ * FIX token: content cap reduced from 4000 to 2500 chars.
+ * Token budget: ~100 + ~2500 content + ~900 output = ~3500 tokens
  */
 const generateFlashcards = async (topicName, notesContent) => {
   const systemPrompt = `You are an expert flashcard creator. Your ONLY output should be a valid JSON array.`;
   const userPrompt = `Topic: ${topicName}
 Content:
-${notesContent.substring(0, 4000)}
+${notesContent.substring(0, 2500)}
 
 Generate 8-12 study flashcards. Return ONLY a JSON array:
 [
@@ -261,35 +316,53 @@ Generate 8-12 study flashcards. Return ONLY a JSON array:
 Each flashcard should test a different key concept. Keep answers concise (1-3 sentences).
 Return ONLY the JSON array. No markdown.`;
 
-  const text = await getCompletion(systemPrompt, userPrompt);
+  // max_tokens: 900 covers 12 flashcards comfortably
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 900);
   return extractJSON(text, 'array');
 };
 
 /**
- * Summarize a topic for quick revision
+ * Summarize a topic for quick revision.
+ * FIX token: content cap reduced from 4000 to 2000 chars.
+ * Token budget: ~100 + ~2000 content + ~300 output = ~2400 tokens
  */
 const summarizeTopic = async (topicName, notesContent) => {
   const systemPrompt = `You are an expert academic summarizer.`;
   const userPrompt = `Topic: ${topicName}
-Full notes: ${notesContent.substring(0, 4000)}
+Full notes: ${notesContent.substring(0, 2000)}
 
 Create a concise 5-7 bullet point quick revision summary. Use simple language a student can quickly scan before an exam. Return plain text, not JSON.`;
 
-  return await getCompletion(systemPrompt, userPrompt);
+  // max_tokens: 300 is plenty for a bullet-point summary
+  return await getCompletion(systemPrompt, userPrompt, 3, 300);
 };
 
 /**
- * Translate notes object to target language
+ * Translate notes object to target language.
+ * FIX Bug 2: Excludes mermaidDiagram (it's code, not translatable text) and flashcards
+ * (already included in notes, translating again wastes tokens).
+ * Only translates: definition, explanation, keyTerms, examples, importantPoints,
+ * summary, importantQuestions, realWorldApplications.
+ * Token budget: ~200 system + ~1500 content + ~1500 output = ~3200 tokens
  */
 const translateNotes = async (notesObj, targetLanguage) => {
   const systemPrompt = `You are an expert technical translator. Translate the provided JSON data into ${targetLanguage} while preserving exactly the same JSON structure and keys. Only modify the string values. DO NOT translate keys.`;
-  
-  // Filter out mongo fields
-  const { _id, topicId, syllabusId, topicName, createdAt, updatedAt, __v, ...contentToTranslate } = notesObj;
-  
+
+  // FIX Bug 2: Exclude fields that should NOT be translated:
+  // - mermaidDiagram: it's code — translating it breaks syntax
+  // - flashcards: already in the notes object, saves tokens
+  // - _id, topicId, syllabusId, topicName, createdAt, updatedAt, __v: Mongo metadata
+  const {
+    _id, topicId, syllabusId, topicName, createdAt, updatedAt, __v,
+    mermaidDiagram,  // FIX: excluded — diagram code must not be translated
+    flashcards,      // FIX: excluded — saves ~300 tokens, already stored separately
+    ...contentToTranslate
+  } = notesObj;
+
   const userPrompt = `Target Language: ${targetLanguage}\n\nStrictly return ONLY a valid JSON object matching the input structure, but with values translated:\n\n${JSON.stringify(contentToTranslate, null, 2)}`;
-  
-  const text = await getCompletion(systemPrompt, userPrompt);
+
+  // max_tokens: 1500 covers the translatable fields
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 1500);
   return extractJSON(text, 'object');
 };
 

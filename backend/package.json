@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon --ignore uploads/ --ignore recent_topics.json server.js"
+    "dev": "nodemon --ignore uploads/ --ignore recent_topics.json server.js",
+    "test": "SKIP_LIVE=1 node --test tests/aiService.test.js",
+    "test:live": "node --test tests/aiService.test.js"
   },
   "keywords": [],
   "author": "",

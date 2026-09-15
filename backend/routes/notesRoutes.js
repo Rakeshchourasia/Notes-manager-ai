@@ -199,13 +199,12 @@ router.post('/quiz/:topicId', async (req, res) => {
         throw new Error('Notes must be generated before taking a quiz.');
     }
 
-    const contentToQuiz = `
-        Topic: ${topic.name}
-        Definition: ${notes.definition}
-        Explanation: ${notes.explanation}
-        Important Points: ${notes.importantPoints.join(', ')}
-        Summary: ${notes.summary}
-    `;
+    // FIX token: exclude 'explanation' (3-5 paragraphs, ~800+ chars) — not needed for quiz generation.
+    // definition + importantPoints + summary gives the AI all the key facts it needs.
+    const contentToQuiz = `Topic: ${topic.name}
+Definition: ${notes.definition}
+Important Points: ${notes.importantPoints.join(', ')}
+Summary: ${notes.summary}`;
 
     const quizQuestions = await generateQuiz(contentToQuiz);
 
