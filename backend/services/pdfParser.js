@@ -1,5 +1,7 @@
 const pdf = require('pdf-parse');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { PDFExtract } = require('pdf.js-extract');
 
 /**
@@ -8,17 +10,23 @@ const { PDFExtract } = require('pdf.js-extract');
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Extract text from a PDF file.
+ * Extract text from a PDF.
+ *
+ * @param {string|Buffer} filePathOrBuffer  — absolute file path OR a Buffer containing PDF bytes
  *
  * Strategy:
  *  1. pdf-parse  — fast, works for standard Unicode/English PDFs
  *  2. pdf.js-extract — highly robust, parses structural XRef correctly
  */
-const extractTextFromPDF = async (filePath) => {
+const extractTextFromPDF = async (filePathOrBuffer) => {
+    // Normalise: always work with a Buffer for pdf-parse
+    const isBuffer = Buffer.isBuffer(filePathOrBuffer);
+    const filePath = isBuffer ? null : filePathOrBuffer;
+
     // --- Attempt 1: pdf-parse ---
     let extractedText = '';
     try {
-        const dataBuffer = fs.readFileSync(filePath);
+        const dataBuffer = isBuffer ? filePathOrBuffer : fs.readFileSync(filePath);
         const data = await pdf(dataBuffer);
         if (data && data.text) {
             // Remove null bytes, keep actual content
@@ -33,16 +41,24 @@ const extractTextFromPDF = async (filePath) => {
 
     // --- Attempt 2: pdf.js-extract fallback ---
     if (!extractedText) {
+        // pdf.js-extract only accepts file paths; write a temp file if we have a Buffer
+        let tempPath = null;
         try {
+            if (isBuffer) {
+                tempPath = path.join(os.tmpdir(), `pdf_tmp_${Date.now()}.pdf`);
+                fs.writeFileSync(tempPath, filePathOrBuffer);
+            }
+
+            const extractPath = tempPath || filePath;
             const pdfExtract = new PDFExtract();
-            const data = await pdfExtract.extract(filePath, { disableWorker: true, disableFontFace: true });
+            const data = await pdfExtract.extract(extractPath, { disableWorker: true, disableFontFace: true });
             if (data && data.pages) {
                 let text = '';
                 data.pages.forEach(page => {
                     page.content.forEach(c => text += c.str + ' ');
                     text += '\n'; // Soft line breaks between pages
                 });
-                
+
                 const cleaned = text.replace(/\0/g, '').replace(/\s+/g, ' ').trim();
                 if (cleaned.length > 30) {
                     extractedText = text;
@@ -50,6 +66,8 @@ const extractTextFromPDF = async (filePath) => {
             }
         } catch (extractErr) {
             console.warn('[pdfParser] pdf.js-extract failed:', extractErr.message);
+        } finally {
+            if (tempPath) { try { fs.unlinkSync(tempPath); } catch (_) {} }
         }
     }
 

@@ -49,9 +49,54 @@ const extractJSON = (text, type = 'object') => {
     return `: "${val}" :`;
   });
 
-  try { return JSON.parse(raw); } catch (e) {
+  try { return JSON.parse(raw); } catch (e) { /* continue to truncation repair */ }
+
+  // 6. Truncation repair — the AI was cut off mid-response (token limit hit).
+  //    Strategy: walk the string tracking open brackets/strings and close them.
+  const repaired = repairTruncatedJSON(raw);
+  try { return JSON.parse(repaired); } catch (e) {
     throw new Error(`AI returned malformed JSON. Retrying may help. Parse error: ${e.message.substring(0, 100)}`);
   }
+};
+
+/**
+ * Attempt to close a JSON string that was cut off by a token limit.
+ * Walks the raw string character-by-character tracking open structures,
+ * then appends the necessary closing characters.
+ */
+const repairTruncatedJSON = (raw) => {
+  let result = raw;
+  // Remove trailing commas that appear right before truncation
+  result = result.replace(/,\s*$/, '');
+
+  const stack = []; // tracks '{' and '['
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < result.length; i++) {
+    const ch = result[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && inString) { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+
+  // Close any open string
+  if (inString) result += '"';
+
+  // Remove any dangling key without a value: ,"key" or ,"key":
+  result = result.replace(/,\s*"[^"]*"\s*:?\s*$/, '');
+  result = result.replace(/,\s*"[^"]*"\s*$/, '');
+
+  // Close open structures in reverse order
+  while (stack.length > 0) {
+    const open = stack.pop();
+    result += open === '{' ? '}' : ']';
+  }
+
+  return result;
 };
 
 /**
@@ -62,7 +107,7 @@ const extractJSON = (text, type = 'object') => {
  * @param {number|null} maxTokens - cap output tokens to control cost; null = model default
  * @param {Array}  messages       - optional full messages array (overrides system/user prompts)
  */
-const getCompletion = async (systemPrompt, userPrompt, retries = 3, maxTokens = null, messages = null) => {
+const getCompletion = async (systemPrompt, userPrompt, retries = 3, maxTokens = null, messages = null, jsonMode = false) => {
   let lastError;
 
   // Validate API key is configured
@@ -84,6 +129,8 @@ const getCompletion = async (systemPrompt, userPrompt, retries = 3, maxTokens = 
       };
       // Only set max_tokens if explicitly provided — avoids errors on models that don't support it
       if (maxTokens) requestBody.max_tokens = maxTokens;
+      // Enable JSON mode if requested and supported by the model (forces valid JSON output)
+      if (jsonMode) requestBody.response_format = { type: 'json_object' };
 
       const response = await openai.chat.completions.create(requestBody);
       return response.choices[0].message.content;
@@ -96,11 +143,17 @@ const getCompletion = async (systemPrompt, userPrompt, retries = 3, maxTokens = 
         throw new Error('Invalid API key. Check AI_API_KEY in your .env file.');
       }
       if (status === 429) {
-        const isQuota = err?.message?.toLowerCase().includes('quota');
-        if (isQuota) {
+        const msg = err?.message?.toLowerCase() || '';
+        if (msg.includes('quota')) {
           throw new Error('AI quota exceeded. Check your billing or switch to a free model.');
         }
-        // Rate limit — retry with backoff
+        // OTPM (Output Tokens Per Minute) limit hit — wait 62s for the window to reset
+        if (msg.includes('output tokens per minute') || msg.includes('otpm')) {
+          console.warn(`[aiService] OTPM limit hit — waiting 62s for the token window to reset...`);
+          await sleep(62000);
+          continue; // retry immediately after wait
+        }
+        // Standard rate limit — retry with backoff
       }
       if (status === 503 && attempt >= retries) {
         throw new Error('AI service is temporarily unavailable. Please try again later.');
@@ -209,36 +262,46 @@ graph TD
  * Token budget: ~600 input + ~3000 context + ~1800 output = ~5400 tokens
  */
 const generateNotes = async (topicName, syllabusContext) => {
-  // FIX Bug 3: Only send a focused excerpt of the syllabus, not the whole thing
+  // Only send a focused excerpt of the syllabus for context
   const contextSnippet = syllabusContext ? syllabusContext.substring(0, 3000) : '';
 
   const systemPrompt = `You are an expert academic tutor and notes writer.
-Your ONLY output should be a valid JSON object. Do not include markdown formatting or explanations.`;
+Your ONLY output must be a single valid JSON object with NO additional text, markdown, or explanation.`;
 
-  const userPrompt = `Generate comprehensive study notes for: "${topicName}"
-Context: "${contextSnippet}"
+  const userPrompt = `Generate comprehensive study notes for the topic: "${topicName}"
+${contextSnippet ? `Syllabus context: "${contextSnippet}"` : ''}
 
-Return ONLY a valid JSON object:
+Return ONLY this JSON structure (no markdown, no extra text):
 {
-  "definition": "1-2 sentence definition",
-  "explanation": "3-5 paragraph explanation for students",
+  "definition": "clear 1-2 sentence definition",
+  "explanation": "2-3 paragraph explanation (keep concise)",
   "keyTerms": [{"term": "Term", "definition": "Definition"}],
-  "examples": [{"title": "Title", "content": "Explanation"}],
-  "importantPoints": ["Point 1", "Point 2"],
-  "summary": "3-5 sentence summary for quick revision",
+  "examples": [{"title": "Title", "content": "Brief explanation"}],
+  "importantPoints": ["Point 1", "Point 2", "Point 3"],
+  "summary": "2-3 sentence summary",
   "importantQuestions": ["Question 1?", "Question 2?"],
   "realWorldApplications": ["Application 1", "Application 2"],
   "flashcards": [{"question": "What is X?", "answer": "X is..."}]
 }
 
-Rules: keyTerms(4-6), examples(2-3), importantPoints(5-8), importantQuestions(3-5), realWorldApplications(2-3), flashcards(5-8).
-Return ONLY the JSON object. No markdown, no explanation.`;
+Keep values SHORT to fit within the token limit:
+- keyTerms: exactly 4, each definition under 15 words
+- examples: exactly 2, content under 20 words each
+- importantPoints: exactly 5, each under 12 words
+- importantQuestions: exactly 3
+- realWorldApplications: exactly 2, each under 15 words
+- flashcards: exactly 5, answers under 15 words each
+- explanation: max 150 words total
+- summary: max 60 words
 
-  // max_tokens: 1800 covers all fields comfortably
-  const text = await getCompletion(systemPrompt, userPrompt, 3, 1800);
+Return ONLY the JSON object.`;
+
+  // 2000 tokens gives the AI enough room to complete the full JSON without truncation.
+  // (Previously 950 was too tight — the response was cut off mid-JSON.)
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 2000, null, true);
   const result = extractJSON(text, 'object');
 
-  // FIX Bug 7: Generate mermaid diagram separately to avoid JSON parse failures
+  // Generate mermaid diagram separately to avoid embedding it inside JSON (causes parse failures)
   result.mermaidDiagram = await generateMermaidDiagram(topicName);
 
   return result;
@@ -292,8 +355,8 @@ Generate 10 multiple-choice questions based on the content. Return ONLY a JSON a
 
 Return ONLY the JSON array. No markdown.`;
 
-  // max_tokens: 1200 covers 10 questions with explanations
-  const text = await getCompletion(systemPrompt, userPrompt, 3, 1200);
+  // max_tokens: 900 — fits within Groq free-tier OTPM limit (10 short MCQs)
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 900);
   return extractJSON(text, 'array');
 };
 
@@ -361,8 +424,8 @@ const translateNotes = async (notesObj, targetLanguage) => {
 
   const userPrompt = `Target Language: ${targetLanguage}\n\nStrictly return ONLY a valid JSON object matching the input structure, but with values translated:\n\n${JSON.stringify(contentToTranslate, null, 2)}`;
 
-  // max_tokens: 1500 covers the translatable fields
-  const text = await getCompletion(systemPrompt, userPrompt, 3, 1500);
+  // max_tokens: 900 — fits within Groq free-tier OTPM limit; translatable fields are concise
+  const text = await getCompletion(systemPrompt, userPrompt, 3, 900);
   return extractJSON(text, 'object');
 };
 

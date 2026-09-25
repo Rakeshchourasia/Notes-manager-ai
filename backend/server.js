@@ -1,15 +1,14 @@
+// ⚠️  MUST be first — loads .env before any other module reads process.env
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const dotenv = require('dotenv');
 const connectDB = require('./config/db');
 const seedAdmin = require('./config/seedAdmin');
 const { errorHandler } = require('./middleware/errorHandler');
 const { protect } = require('./middleware/auth');
 const { generalRateLimiter, aiRateLimiter, authRateLimiter } = require('./middleware/rateLimiter');
-
-// Load env vars
-dotenv.config();
 
 const app = express();
 

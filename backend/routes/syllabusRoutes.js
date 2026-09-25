@@ -1,68 +1,47 @@
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const Syllabus = require('../models/Syllabus');
 const Topic = require('../models/Topic');
 const { extractTextFromPDF } = require('../services/pdfParser');
 const { extractTopics } = require('../services/aiService');
-
-// Multer config — use absolute destination path
-const uploadsDir = path.join(__dirname, '../uploads');
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => {
-        // Sanitize filename to avoid issues with spaces / special chars
-        const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}-${safeName}`);
-    },
-});
-
-const upload = multer({
-    storage,
-    fileFilter: (req, file, cb) => {
-        const allowed = ['application/pdf', 'text/plain'];
-        // Some browsers send PDF as 'application/octet-stream' — check extension too
-        const ext = path.extname(file.originalname).toLowerCase();
-        if (allowed.includes(file.mimetype) || ext === '.pdf' || ext === '.txt') {
-            cb(null, true);
-        } else {
-            cb(new Error('Only PDF and TXT files are allowed'));
-        }
-    },
-    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
-
-// Helper: get absolute file path from multer file object (works with multer v1 & v2)
-const getFilePath = (file) => {
-    if (file.path && path.isAbsolute(file.path)) return file.path;
-    if (file.destination && file.filename) return path.join(file.destination, file.filename);
-    // fallback
-    return path.join(uploadsDir, file.filename);
-};
+const uploadToMemory = require('../middleware/s3Upload');
+const { uploadToS3, deleteFromS3, getS3Url } = require('../services/s3Service');
 
 // POST /api/syllabus/upload
-router.post('/upload', upload.single('syllabus'), async (req, res) => {
+router.post('/upload', uploadToMemory.single('syllabus'), async (req, res) => {
     const { title, examDate } = req.body;
 
     // Sanitize pasted text: strip HTML tags and limit length
     let rawText = (req.body.pastedText || '').replace(/<[^>]*>/g, '').trim().substring(0, 50000);
     let fileType = 'paste';
     let fileUrl = null;
+    let s3Key = null;
 
-    let pdfWarning = null; // warning to include in response if PDF extraction degraded
+    let pdfWarning = null;
 
     if (req.file) {
-        const filePath = getFilePath(req.file);
+        // req.file.buffer contains the full file (multer.memoryStorage)
+        const fileBuffer = req.file.buffer;
+        const safeName = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+        s3Key = `uploads/${Date.now()}-${safeName}`;
+
         fileType = (req.file.mimetype === 'application/pdf' ||
-            path.extname(req.file.originalname).toLowerCase() === '.pdf') ? 'pdf' : 'text';
-        fileUrl = `/uploads/${req.file.filename}`;
+            req.file.originalname.toLowerCase().endsWith('.pdf')) ? 'pdf' : 'text';
 
         if (fileType === 'pdf') {
+            // Step 1: Upload the PDF to S3 first
             try {
-                rawText = await extractTextFromPDF(filePath);
+                await uploadToS3(fileBuffer, s3Key, req.file.mimetype);
+                console.log(`[S3] Uploaded: ${s3Key}`);
+            } catch (uploadErr) {
+                // If S3 upload fails, log it and try to parse directly from the buffer in memory
+                console.warn('[S3] Upload failed, parsing from memory buffer directly:', uploadErr.message);
+                s3Key = null; // nothing to delete later
+            }
+
+            // Step 2: Parse text — directly from the in-memory buffer (no need to download back from S3)
+            try {
+                rawText = await extractTextFromPDF(fileBuffer);
             } catch (parseErr) {
                 console.warn('PDF extraction failed, using title as fallback context:', parseErr.message);
                 pdfWarning = 'Could not extract text from PDF — AI will generate topics based on your title.';
@@ -70,18 +49,15 @@ router.post('/upload', upload.single('syllabus'), async (req, res) => {
                     `Source: ${req.file.originalname}\n` +
                     `Please generate relevant academic topics for this subject.`;
             } finally {
-                // Always delete the uploaded file after extraction to save disk space
-                try { fs.unlinkSync(filePath); } catch (_) {}
+                // Delete from S3 — we already have the text, no need to keep the raw PDF
+                if (s3Key) {
+                    try { await deleteFromS3(s3Key); } catch (_) {}
+                }
+                fileUrl = null; // PDF no longer lives in S3
             }
         } else {
-            try {
-                rawText = fs.readFileSync(filePath, 'utf-8').substring(0, 50000);
-                fs.unlinkSync(filePath); // delete after reading
-            } catch (readErr) {
-                try { fs.unlinkSync(filePath); } catch (_) { }
-                res.status(400);
-                throw new Error(`Failed to read text file: ${readErr.message}`);
-            }
+            // TXT file: read directly from buffer — no S3 upload needed
+            rawText = fileBuffer.toString('utf-8').substring(0, 50000);
         }
     }
 
@@ -113,8 +89,6 @@ router.post('/upload', upload.single('syllabus'), async (req, res) => {
     }
 
     if (!topicsData || topicsData.length === 0) {
-        // Last resort: create numbered placeholder topics from the title
-        // This happens when both AI and regex extraction fail (e.g. quota + encoded PDF)
         const subjectName = title || 'Main Subject';
         if (aiError) pdfWarning = (pdfWarning ? pdfWarning + ' ' : '') +
             'AI API error — placeholder topics created. Please check your API key and try again.';
@@ -125,8 +99,6 @@ router.post('/upload', upload.single('syllabus'), async (req, res) => {
         }));
     }
 
-    // Save topics
-    // Save topics with robust key checking in case AI json has variations
     const savedTopics = await Promise.all(
         topicsData.map((t, i) => Topic.create({
             name: t.name || t.topicName || t.Topic || t.title || t['Topic Name'] || t.topic || `${title || 'Unknown Subject'} — Topic ${i + 1}`,
